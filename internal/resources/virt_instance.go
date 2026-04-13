@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
@@ -145,6 +146,9 @@ func (r *VirtInstanceResource) Schema(ctx context.Context, req resource.SchemaRe
 			"memory": schema.Int64Attribute{
 				Description: "Memory allocation in bytes. Minimum 33554432 (32 MiB).",
 				Optional:    true,
+				PlanModifiers: []planmodifier.Int64{
+					int64planmodifier.RequiresReplace(),
+				},
 				Validators: []validator.Int64{
 					int64validator.AtLeast(33554432),
 				},
@@ -152,6 +156,9 @@ func (r *VirtInstanceResource) Schema(ctx context.Context, req resource.SchemaRe
 			"cpu": schema.StringAttribute{
 				Description: "CPU allocation (e.g., '2' for 2 cores).",
 				Optional:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
 			},
 			"autostart": schema.BoolAttribute{
 				Description: "Whether to start the container automatically on boot. Defaults to false.",
