@@ -11,6 +11,8 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
+replace github.com/deevus/truenas-go => ../truenas-go
+
 require (
 	al.essio.dev/pkg/shellescape v1.6.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect

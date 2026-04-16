@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
@@ -43,6 +44,8 @@ type VirtInstanceResourceModel struct {
 	StoragePool     types.String `tfsdk:"storage_pool"`
 	ImageName       types.String `tfsdk:"image_name"`
 	ImageVersion    types.String `tfsdk:"image_version"`
+	Memory          types.Int64  `tfsdk:"memory"`
+	CPU             types.String `tfsdk:"cpu"`
 	Autostart       types.Bool   `tfsdk:"autostart"`
 	DesiredState    types.String `tfsdk:"desired_state"`
 	StateTimeout    types.Int64  `tfsdk:"state_timeout"`
@@ -140,6 +143,23 @@ func (r *VirtInstanceResource) Schema(ctx context.Context, req resource.SchemaRe
 					stringplanmodifier.RequiresReplace(),
 				},
 			},
+			"memory": schema.Int64Attribute{
+				Description: "Memory allocation in bytes. Minimum 33554432 (32 MiB).",
+				Optional:    true,
+				PlanModifiers: []planmodifier.Int64{
+					int64planmodifier.RequiresReplace(),
+				},
+				Validators: []validator.Int64{
+					int64validator.AtLeast(33554432),
+				},
+			},
+			"cpu": schema.StringAttribute{
+				Description: "CPU allocation (e.g., '2' for 2 cores).",
+				Optional:    true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
 			"autostart": schema.BoolAttribute{
 				Description: "Whether to start the container automatically on boot. Defaults to false.",
 				Optional:    true,
@@ -211,6 +231,9 @@ func (r *VirtInstanceResource) Schema(ctx context.Context, req resource.SchemaRe
 							Description: "Device name (auto-generated if not specified).",
 							Optional:    true,
 							Computed:    true,
+							PlanModifiers: []planmodifier.String{
+								stringplanmodifier.UseStateForUnknown(),
+							},
 						},
 						"source": schema.StringAttribute{
 							Description: "Source path on the host (e.g., '/mnt/tank/data').",
@@ -235,6 +258,9 @@ func (r *VirtInstanceResource) Schema(ctx context.Context, req resource.SchemaRe
 							Description: "Device name (auto-generated if not specified).",
 							Optional:    true,
 							Computed:    true,
+							PlanModifiers: []planmodifier.String{
+								stringplanmodifier.UseStateForUnknown(),
+							},
 						},
 						"network": schema.StringAttribute{
 							Description: "Network name to attach to.",
@@ -262,6 +288,9 @@ func (r *VirtInstanceResource) Schema(ctx context.Context, req resource.SchemaRe
 							Description: "Device name (auto-generated if not specified).",
 							Optional:    true,
 							Computed:    true,
+							PlanModifiers: []planmodifier.String{
+								stringplanmodifier.UseStateForUnknown(),
+							},
 						},
 						"source_proto": schema.StringAttribute{
 							Description: "Source protocol: 'TCP' or 'UDP'.",
@@ -605,7 +634,11 @@ func (r *VirtInstanceResource) Update(ctx context.Context, req resource.UpdateRe
 
 	if container != nil {
 		r.mapVirtInstanceToModel(container, &data)
-		// Devices are preserved from plan - reconcileDevices already handled add/delete
+		// Populate device names from live API response (plan has unknown names since they're Computed)
+		liveDevices, err := r.services.Virt.ListDevices(ctx, containerID)
+		if err == nil {
+			r.matchCreatedDevices(liveDevices, &data)
+		}
 	} else {
 		data.State = types.StringValue(currentState)
 	}
@@ -675,6 +708,14 @@ func (r *VirtInstanceResource) buildCreateOpts(ctx context.Context, data *VirtIn
 		Image:        imageStr,
 		InstanceType: "CONTAINER",
 		StoragePool:  data.StoragePool.ValueString(),
+	}
+
+	if !data.Memory.IsNull() && !data.Memory.IsUnknown() {
+		opts.Memory = data.Memory.ValueInt64()
+	}
+
+	if !data.CPU.IsNull() && !data.CPU.IsUnknown() {
+		opts.CPU = data.CPU.ValueString()
 	}
 
 	if !data.Autostart.IsNull() && !data.Autostart.IsUnknown() {
@@ -791,10 +832,28 @@ func (r *VirtInstanceResource) mapVirtInstanceToModel(container *truenas.VirtIns
 	data.ID = types.StringValue(container.ID)
 	data.Name = types.StringValue(container.Name)
 	data.StoragePool = types.StringValue(container.StoragePool)
-	// Preserve ImageName and ImageVersion from plan/state - API may return different casing
-	// These fields have RequiresReplace so they don't change during resource lifecycle
+	// Preserve ImageName and ImageVersion from plan/state when already set.
+	// Populate from API response when null/unknown (e.g., after import).
+	if data.ImageName.IsNull() || data.ImageName.IsUnknown() {
+		data.ImageName = types.StringValue(strings.ToLower(container.Image.OS))
+	}
+	if data.ImageVersion.IsNull() || data.ImageVersion.IsUnknown() {
+		data.ImageVersion = types.StringValue(container.Image.Release + "/" + container.Image.Variant)
+	}
 	data.State = types.StringValue(container.Status)
 	data.Autostart = types.BoolValue(container.Autostart)
+
+	if container.Memory > 0 {
+		data.Memory = types.Int64Value(container.Memory)
+	} else {
+		data.Memory = types.Int64Null()
+	}
+
+	if container.CPU != "" {
+		data.CPU = types.StringValue(container.CPU)
+	} else {
+		data.CPU = types.StringNull()
+	}
 
 	// Use container ID as UUID (virt.instance uses name as ID)
 	data.UUID = types.StringValue(container.ID)
@@ -950,8 +1009,7 @@ func (r *VirtInstanceResource) matchCreatedDevices(apiDevices []truenas.VirtDevi
 	// Match disks by source+destination
 	for i := range data.Disks {
 		planDisk := &data.Disks[i]
-		// If name was specified, keep it. Otherwise find the matching device.
-		if !planDisk.Name.IsNull() && planDisk.Name.ValueString() != "" {
+		if !planDisk.Name.IsNull() && !planDisk.Name.IsUnknown() && planDisk.Name.ValueString() != "" {
 			continue
 		}
 		for _, apiDev := range apiDevices {
@@ -971,7 +1029,7 @@ func (r *VirtInstanceResource) matchCreatedDevices(apiDevices []truenas.VirtDevi
 	// Match NICs by network (or parent for MACVLAN)
 	for i := range data.NICs {
 		planNIC := &data.NICs[i]
-		if !planNIC.Name.IsNull() && planNIC.Name.ValueString() != "" {
+		if !planNIC.Name.IsNull() && !planNIC.Name.IsUnknown() && planNIC.Name.ValueString() != "" {
 			continue
 		}
 		for _, apiDev := range apiDevices {
@@ -998,7 +1056,7 @@ func (r *VirtInstanceResource) matchCreatedDevices(apiDevices []truenas.VirtDevi
 	// Match proxies by source_proto+source_port+dest_proto+dest_port
 	for i := range data.Proxies {
 		planProxy := &data.Proxies[i]
-		if !planProxy.Name.IsNull() && planProxy.Name.ValueString() != "" {
+		if !planProxy.Name.IsNull() && !planProxy.Name.IsUnknown() && planProxy.Name.ValueString() != "" {
 			continue
 		}
 		for _, apiDev := range apiDevices {
@@ -1021,6 +1079,17 @@ func (r *VirtInstanceResource) matchCreatedDevices(apiDevices []truenas.VirtDevi
 
 // reconcileDevices adds/removes devices to match the desired state.
 func (r *VirtInstanceResource) reconcileDevices(ctx context.Context, containerID string, plan, state *VirtInstanceResourceModel) error {
+	// Query live devices first to ground all decisions in reality
+	liveDevices, err := r.services.Virt.ListDevices(ctx, containerID)
+	if err != nil {
+		return fmt.Errorf("failed to list live devices for container %q: %w", containerID, err)
+	}
+
+	liveByName := make(map[string]truenas.VirtDevice)
+	for _, d := range liveDevices {
+		liveByName[d.Name] = d
+	}
+
 	// Get current device names from state
 	stateDeviceNames := make(map[string]bool)
 	for _, d := range state.Disks {
@@ -1057,74 +1126,129 @@ func (r *VirtInstanceResource) reconcileDevices(ctx context.Context, containerID
 		}
 	}
 
-	// Delete devices that are in state but not in plan
+	// Delete devices that are in state but not in plan, AND still exist live.
+	// Devices in state but missing from live were already removed (e.g., failed prior apply).
 	for name := range stateDeviceNames {
 		if !planDeviceNames[name] {
-			err := r.services.Virt.DeleteDevice(ctx, containerID, name)
-			if err != nil {
-				return fmt.Errorf("failed to delete device %q: %w", name, err)
+			if _, exists := liveByName[name]; exists {
+				err := r.services.Virt.DeleteDevice(ctx, containerID, name)
+				if err != nil {
+					return fmt.Errorf("failed to delete device %q: %w", name, err)
+				}
 			}
 		}
 	}
 
-	// Add devices that are in plan but not in state
+	// Build a set of live devices keyed by properties for matching plan devices.
+	// This handles the case where plan device names are unknown (Computed) but the
+	// device already exists live with matching properties.
+	type diskKey struct{ source, destination string }
+	type proxyKey struct{ sourceProto string; sourcePort int64; destProto string; destPort int64 }
+
+	liveDisks := make(map[diskKey]string)   // key -> device name
+	liveProxies := make(map[proxyKey]string) // key -> device name
+	for _, d := range liveDevices {
+		switch d.DevType {
+		case "DISK":
+			if d.Source != "" && d.Destination != "" {
+				liveDisks[diskKey{d.Source, d.Destination}] = d.Name
+			}
+		case "PROXY":
+			liveProxies[proxyKey{d.SourceProto, d.SourcePort, d.DestProto, d.DestPort}] = d.Name
+		}
+	}
+
+	// Add disk devices from plan that don't already exist live.
 	for _, disk := range plan.Disks {
 		name := disk.Name.ValueString()
-		if name != "" && !stateDeviceNames[name] {
-			opts := truenas.VirtDeviceOpts{
-				DevType:     "DISK",
-				Name:        name,
-				Source:      disk.Source.ValueString(),
-				Destination: disk.Destination.ValueString(),
-			}
-			if !disk.Readonly.IsNull() {
-				opts.Readonly = disk.Readonly.ValueBool()
-			}
-			err := r.services.Virt.AddDevice(ctx, containerID, opts)
-			if err != nil {
-				return fmt.Errorf("failed to add disk device %q: %w", name, err)
-			}
+		src := disk.Source.ValueString()
+		dst := disk.Destination.ValueString()
+		key := diskKey{src, dst}
+
+		// Skip if already exists by name or by matching properties
+		if name != "" && liveByName[name].Name == name {
+			continue
+		}
+		if liveName, found := liveDisks[key]; found {
+			// Device exists with matching properties, skip
+			_ = liveName
+			continue
+		}
+
+		opts := truenas.VirtDeviceOpts{
+			DevType:     "DISK",
+			Name:        name,
+			Source:      src,
+			Destination: dst,
+		}
+		if !disk.Readonly.IsNull() {
+			opts.Readonly = disk.Readonly.ValueBool()
+		}
+		err := r.services.Virt.AddDevice(ctx, containerID, opts)
+		if err != nil {
+			return fmt.Errorf("failed to add disk device %q: %w", name, err)
 		}
 	}
 
+	// Add NIC devices from plan that don't already exist live.
 	for _, nic := range plan.NICs {
 		name := nic.Name.ValueString()
-		if name != "" && !stateDeviceNames[name] {
-			opts := truenas.VirtDeviceOpts{
-				DevType: "NIC",
-				Name:    name,
+		if name != "" {
+			if _, exists := liveByName[name]; exists {
+				continue
 			}
-			if !nic.Network.IsNull() && nic.Network.ValueString() != "" {
-				opts.Network = nic.Network.ValueString()
-			}
-			if !nic.NICType.IsNull() && nic.NICType.ValueString() != "" {
-				opts.NICType = nic.NICType.ValueString()
-			}
-			if !nic.Parent.IsNull() && nic.Parent.ValueString() != "" {
-				opts.Parent = nic.Parent.ValueString()
-			}
-			err := r.services.Virt.AddDevice(ctx, containerID, opts)
-			if err != nil {
-				return fmt.Errorf("failed to add NIC device %q: %w", name, err)
-			}
+		}
+		if name == "" {
+			continue
+		}
+
+		opts := truenas.VirtDeviceOpts{
+			DevType: "NIC",
+			Name:    name,
+		}
+		if !nic.Network.IsNull() && nic.Network.ValueString() != "" {
+			opts.Network = nic.Network.ValueString()
+		}
+		if !nic.NICType.IsNull() && nic.NICType.ValueString() != "" {
+			opts.NICType = nic.NICType.ValueString()
+		}
+		if !nic.Parent.IsNull() && nic.Parent.ValueString() != "" {
+			opts.Parent = nic.Parent.ValueString()
+		}
+		err := r.services.Virt.AddDevice(ctx, containerID, opts)
+		if err != nil {
+			return fmt.Errorf("failed to add NIC device %q: %w", name, err)
 		}
 	}
 
+	// Add proxy devices from plan that don't already exist live.
 	for _, proxy := range plan.Proxies {
 		name := proxy.Name.ValueString()
-		if name != "" && !stateDeviceNames[name] {
-			opts := truenas.VirtDeviceOpts{
-				DevType:     "PROXY",
-				Name:        name,
-				SourceProto: proxy.SourceProto.ValueString(),
-				SourcePort:  proxy.SourcePort.ValueInt64(),
-				DestProto:   proxy.DestProto.ValueString(),
-				DestPort:    proxy.DestPort.ValueInt64(),
-			}
-			err := r.services.Virt.AddDevice(ctx, containerID, opts)
-			if err != nil {
-				return fmt.Errorf("failed to add proxy device %q: %w", name, err)
-			}
+		sp := proxy.SourcePort.ValueInt64()
+		dp := proxy.DestPort.ValueInt64()
+		sproto := proxy.SourceProto.ValueString()
+		dproto := proxy.DestProto.ValueString()
+		key := proxyKey{sproto, sp, dproto, dp}
+
+		// Skip if already exists by name or by matching properties
+		if name != "" && liveByName[name].Name == name {
+			continue
+		}
+		if _, found := liveProxies[key]; found {
+			continue
+		}
+
+		opts := truenas.VirtDeviceOpts{
+			DevType:     "PROXY",
+			Name:        name,
+			SourceProto: sproto,
+			SourcePort:  sp,
+			DestProto:   dproto,
+			DestPort:    dp,
+		}
+		err := r.services.Virt.AddDevice(ctx, containerID, opts)
+		if err != nil {
+			return fmt.Errorf("failed to add proxy device %q: %w", name, err)
 		}
 	}
 

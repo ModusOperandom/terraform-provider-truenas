@@ -89,7 +89,7 @@ func TestVirtInstanceResource_Schema(t *testing.T) {
 
 	// Test optional attributes
 	optionalAttrs := []string{
-		"autostart", "desired_state", "state_timeout", "shutdown_timeout",
+		"memory", "cpu", "autostart", "desired_state", "state_timeout", "shutdown_timeout",
 	}
 	for _, name := range optionalAttrs {
 		attr, ok := attrs[name]
@@ -135,6 +135,8 @@ func mockVirtInstanceWithAliases(name, status string, autostart bool, aliases []
 		Status:      status,
 		Autostart:   autostart,
 		Aliases:     aliases,
+		Memory:      4294967296,
+		CPU:         "2",
 	}
 }
 
@@ -145,6 +147,8 @@ type virtInstanceModelParams struct {
 	StoragePool     interface{}
 	ImageName       interface{}
 	ImageVersion    interface{}
+	Memory          interface{}
+	CPU             interface{}
 	Autostart       interface{}
 	DesiredState    interface{}
 	StateTimeout    interface{}
@@ -308,6 +312,8 @@ func createVirtInstanceModelValue(p virtInstanceModelParams) tftypes.Value {
 		"storage_pool":     tftypes.NewValue(tftypes.String, p.StoragePool),
 		"image_name":       tftypes.NewValue(tftypes.String, p.ImageName),
 		"image_version":    tftypes.NewValue(tftypes.String, p.ImageVersion),
+		"memory":           tftypes.NewValue(tftypes.Number, p.Memory),
+		"cpu":              tftypes.NewValue(tftypes.String, p.CPU),
 		"autostart":        tftypes.NewValue(tftypes.Bool, p.Autostart),
 		"desired_state":    tftypes.NewValue(tftypes.String, p.DesiredState),
 		"state_timeout":    tftypes.NewValue(tftypes.Number, p.StateTimeout),
@@ -327,6 +333,8 @@ func createVirtInstanceModelValue(p virtInstanceModelParams) tftypes.Value {
 			"storage_pool":     tftypes.String,
 			"image_name":       tftypes.String,
 			"image_version":    tftypes.String,
+			"memory":           tftypes.Number,
+			"cpu":              tftypes.String,
 			"autostart":        tftypes.Bool,
 			"desired_state":    tftypes.String,
 			"state_timeout":    tftypes.Number,
@@ -639,6 +647,67 @@ func TestVirtInstanceResource_Create_WithDesiredStateStopped(t *testing.T) {
 	}
 }
 
+func TestVirtInstanceResource_Create_WithMemoryAndCPU(t *testing.T) {
+	var capturedOpts truenas.CreateVirtInstanceOpts
+
+	r := newTestVirtInstanceResource(&truenas.MockVirtService{
+		CreateInstanceFunc: func(ctx context.Context, opts truenas.CreateVirtInstanceOpts) (*truenas.VirtInstance, error) {
+			capturedOpts = opts
+			return mockVirtInstance("test-container", "RUNNING", false), nil
+		},
+		GetInstanceFunc: func(ctx context.Context, name string) (*truenas.VirtInstance, error) {
+			return mockVirtInstance("test-container", "RUNNING", false), nil
+		},
+	})
+
+	schemaResp := getVirtInstanceResourceSchema(t)
+	planValue := createVirtInstanceModelValue(virtInstanceModelParams{
+		Name:         "test-container",
+		StoragePool:  "tank",
+		ImageName:    "ubuntu",
+		ImageVersion: "24.04",
+		Memory:       float64(4294967296),
+		CPU:          "2",
+		DesiredState: "RUNNING",
+		StateTimeout: float64(90),
+	})
+
+	req := resource.CreateRequest{
+		Plan: tfsdk.Plan{
+			Schema: schemaResp.Schema,
+			Raw:    planValue,
+		},
+	}
+
+	resp := &resource.CreateResponse{
+		State: tfsdk.State{
+			Schema: schemaResp.Schema,
+		},
+	}
+
+	r.Create(context.Background(), req, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected errors: %v", resp.Diagnostics)
+	}
+
+	if capturedOpts.Memory != 4294967296 {
+		t.Errorf("expected memory 4294967296, got %d", capturedOpts.Memory)
+	}
+	if capturedOpts.CPU != "2" {
+		t.Errorf("expected cpu '2', got %q", capturedOpts.CPU)
+	}
+
+	var resultData VirtInstanceResourceModel
+	resp.State.Get(context.Background(), &resultData)
+	if resultData.Memory.ValueInt64() != 4294967296 {
+		t.Errorf("expected memory state 4294967296, got %d", resultData.Memory.ValueInt64())
+	}
+	if resultData.CPU.ValueString() != "2" {
+		t.Errorf("expected cpu state '2', got %q", resultData.CPU.ValueString())
+	}
+}
+
 func TestVirtInstanceResource_Create_APIError(t *testing.T) {
 	r := newTestVirtInstanceResource(&truenas.MockVirtService{
 		CreateInstanceFunc: func(ctx context.Context, opts truenas.CreateVirtInstanceOpts) (*truenas.VirtInstance, error) {
@@ -806,6 +875,56 @@ func TestVirtInstanceResource_Read_APIError(t *testing.T) {
 
 	if !resp.Diagnostics.HasError() {
 		t.Fatal("expected error for API error")
+	}
+}
+
+func TestVirtInstanceResource_Read_MapsMemoryAndCPU(t *testing.T) {
+	r := newTestVirtInstanceResource(&truenas.MockVirtService{
+		GetInstanceFunc: func(ctx context.Context, name string) (*truenas.VirtInstance, error) {
+			return mockVirtInstance("test-container", "RUNNING", true), nil
+		},
+	})
+
+	schemaResp := getVirtInstanceResourceSchema(t)
+	stateValue := createVirtInstanceModelValue(virtInstanceModelParams{
+		ID:           "test-container",
+		Name:         "test-container",
+		StoragePool:  "tank",
+		ImageName:    "ubuntu",
+		ImageVersion: "24.04",
+		DesiredState: "RUNNING",
+		StateTimeout: float64(90),
+	})
+
+	req := resource.ReadRequest{
+		State: tfsdk.State{
+			Schema: schemaResp.Schema,
+			Raw:    stateValue,
+		},
+	}
+
+	resp := &resource.ReadResponse{
+		State: tfsdk.State{
+			Schema: schemaResp.Schema,
+		},
+	}
+
+	r.Read(context.Background(), req, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected errors: %v", resp.Diagnostics)
+	}
+
+	var model VirtInstanceResourceModel
+	diags := resp.State.Get(context.Background(), &model)
+	if diags.HasError() {
+		t.Fatalf("failed to get state: %v", diags)
+	}
+	if model.Memory.ValueInt64() != 4294967296 {
+		t.Errorf("expected memory 4294967296, got %d", model.Memory.ValueInt64())
+	}
+	if model.CPU.ValueString() != "2" {
+		t.Errorf("expected cpu '2', got %q", model.CPU.ValueString())
 	}
 }
 

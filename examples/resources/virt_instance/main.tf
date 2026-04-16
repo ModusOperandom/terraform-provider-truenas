@@ -4,5 +4,7 @@ resource "truenas_virt_instance" "example" {
   image_name    = "ubuntu"
   image_version = "24.04"
   storage_pool  = "tank"
+  memory        = 4294967296
+  cpu           = "2"
   autostart     = true
 }
